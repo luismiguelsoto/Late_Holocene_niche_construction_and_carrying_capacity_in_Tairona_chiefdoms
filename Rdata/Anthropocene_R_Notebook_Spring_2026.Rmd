@@ -1,0 +1,1338 @@
+---
+title: Late Holocene niche construction and carrying capacity in Tairona chiefdoms of the Río Frío Basin, Sierra Nevada de Santa Marta, Colombia
+author: "Luis Miguel Soto Rodriguez, University of Pittsburgh"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: '3'
+    df_print: paged
+  html_notebook:
+    toc: true
+    toc_depth: 3
+    df_print: paged
+  word_document:
+    toc: true
+    toc_depth: '3'
+editor_options:
+  chunk_output_type: inline
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, warning=FALSE, message=FALSE, fig.align="center", dpi=300, comment=NA, fig.width=11, fig.height=8.5)
+```
+
+# 1. Package loading and data input
+
+```{r s01-data-input}
+
+packages <- c(
+  "sf", "sp", "terra", "raster", "dplyr", "tibble", "ggplot2", "tidyr",
+  "patchwork", "ggspatial", "scales", "viridis", "stringr", "knitr",
+  "gdistance",
+  "spatstat", "spatstat.geom", "spatstat.explore", "spatstat.random",
+  "car", "corrplot", "future", "furrr", "parallelly"
+)
+install_if_missing <- function(p) {
+  if (!requireNamespace(p, quietly = TRUE)) install.packages(p, dependencies = TRUE)
+}
+invisible(lapply(packages, install_if_missing))
+invisible(lapply(packages, function(p) suppressPackageStartupMessages(library(p, character.only = TRUE))))
+set.seed(42)
+
+logical_cores <- parallel::detectCores(logical = TRUE)
+if (is.na(logical_cores)) logical_cores <- 1
+n_workers <- max(1, min(22, logical_cores - 2))
+options(future.globals.maxSize = 20 * 1024^3)
+future::plan(future::multisession, workers = n_workers)
+
+periods       <- c("Neguanje","Buritaca","Tairona")
+period_colors <- c(Neguanje="#1f77b4", Buritaca="#ff7f0e", Tairona="#2ca02c")
+
+rdata_base <- "https://raw.githubusercontent.com/luismiguelsoto/Late_Holocene_niche_construction_and_carrying_capacity_in_Tairona_chiefdoms/main/Rdata/"
+rdata_dir  <- file.path(tempdir(), "Rdata_NCT")
+if (!dir.exists(rdata_dir)) dir.create(rdata_dir, recursive = TRUE)
+
+rdata_files <- c(
+  "struc_neg.RData","struc_bur.RData","struc_tai.RData",
+  "sites_neg.RData","sites_bur.RData","sites_tai.RData",
+  "survey_sf.RData","dem.RData","soil.RData"
+)
+for (f in rdata_files) {
+  dest <- file.path(rdata_dir, f)
+  if (!file.exists(dest)) download.file(paste0(rdata_base, f), dest, mode = "wb", quiet = TRUE)
+  load(dest, envir = environment())
+}
+
+dem  <- terra::unwrap(dem_wrapped)
+soil <- terra::unwrap(soil_wrapped)
+```
+
+# 2. DEM terrain derivatives and hydrological indices
+
+```{r s02-terrain}
+
+slope_deg  <- terrain(dem, v="slope", unit="degrees")
+slope_rad  <- terrain(dem, v="slope", unit="radians")
+aspect_deg <- terrain(dem, v="aspect", unit="degrees")
+tpi        <- terrain(dem, v="TPI"); tri <- terrain(dem, v="TRI")
+roughness  <- terrain(dem, v="roughness"); flowdir <- terrain(dem, v="flowdir")
+hillshade  <- shade(slope_rad, terrain(dem, v="aspect", unit="radians"), angle=45, direction=315)
+r_cell <- res(dem)[1]
+w_curv <- matrix(c(0,1,0,1,-4,1,0,1,0), nrow=3, byrow=TRUE)/(r_cell^2)
+curvature <- focal(dem, w=w_curv, fun="sum", na.rm=TRUE); names(curvature) <- "curvature"
+compute_twi <- function(dem, slope_rad, flowdir) {
+  fa <- tryCatch({ terra::flowAccumulation(flowdir) }, error=function(e) NULL)
+  if (is.null(fa) || length(unique(values(fa, na.rm=TRUE)[,1])) < 2) { acc <- dem*0+1
+    for (i in 1:5) { nm <- focal(acc,w=matrix(1/9,3,3),fun="sum",na.rm=TRUE)
+      ds <- focal(dem,w=matrix(1/9,3,3),fun="mean",na.rm=TRUE); acc <- acc+ifel(dem<ds,nm*0.5,0) }
+    fa <- acc }
+  sca <- (fa+1)*prod(res(dem))/res(dem)[1]
+  sc  <- ifel(slope_rad<0.0087,0.0087,slope_rad)
+  twi <- clamp(log(sca/tan(sc)), lower=0, upper=25); names(twi) <- "TWI"
+  list(twi=twi, flow_acc=fa) }
+
+twi_result <- compute_twi(dem, slope_rad, flowdir); twi <- twi_result$twi; flow_acc <- twi_result$flow_acc
+
+spi <- clamp(log(flow_acc*tan(ifel(slope_rad<0.0087,0.0087,slope_rad))+1), lower=0, upper=20); names(spi) <- "SPI"
+lat_rad    <- 11*pi/180; zenith <- acos(cos(lat_rad)); azimuth_rad <- pi
+aspect_rad <- terrain(dem, v="aspect", unit="radians")
+solar_proxy <- clamp(cos(slope_rad)*cos(zenith)+sin(slope_rad)*sin(zenith)*cos(aspect_rad-azimuth_rad), lower=0, upper=1)
+names(solar_proxy) <- "Solar_Proxy"
+hand_proxy <- dem - focal(dem, w=matrix(1,51,51), fun="min", na.rm=TRUE)
+hand_proxy <- clamp(hand_proxy, lower=0, upper=quantile(values(hand_proxy,na.rm=TRUE),0.99,na.rm=TRUE))
+names(hand_proxy) <- "HAND_proxy"
+```
+
+# 3. Anisotropic cost surface (Tobler / gdistance)
+
+```{r s03-cost-surface}
+
+dem_rl <- raster::raster(dem)
+tr_tobler <- transition(dem_rl, transitionFunction=function(x){
+  dz <- abs(x[2]-x[1]); sl <- atan(dz/12.5)
+  6*exp(-3.5*abs(tan(sl)+0.05))*1000/3600
+}, directions=16, symm=FALSE)
+tr_tobler_gc <- geoCorrection(tr_tobler, type="c")
+
+compute_isochrones <- function(sites_sf, tr_layer, label, time_min=c(30,60,90)) {
+  centroids <- st_centroid(sites_sf)
+  coords <- st_coordinates(centroids)
+  
+  cost_min <- tryCatch({
+    accCost(tr_layer, coords)
+  }, error = function(e) {
+    return(NULL)
+  })
+  
+  if(is.null(cost_min)) return(NULL)
+  
+  cm <- cost_min / 60
+  isos <- list()
+  ct <- rast(cm)
+  
+  for(t in time_min) {
+    ib <- ifel(ct <= t, 1, NA)
+    ip <- tryCatch(
+      as.polygons(ib) %>% st_as_sf() %>% st_union() %>% st_make_valid(),
+      error = function(e) NULL
+    )
+    if(!is.null(ip)) {
+      isos[[as.character(t)]] <- tryCatch(
+        st_intersection(ip, survey_sf),
+        error = function(e) ip
+      )
+    }
+  }
+  list(cost_raster = ct, isochrones = isos)
+}
+
+iso_neg <- compute_isochrones(sites_neg, tr_tobler_gc, "Neguanje")
+iso_bur <- compute_isochrones(sites_bur, tr_tobler_gc, "Buritaca")
+iso_tai <- compute_isochrones(sites_tai, tr_tobler_gc, "Tairona")
+```
+
+# 4. Extract topographic values and define structure pool
+
+```{r s04-extract}
+
+topo_stack <- c(dem, slope_deg, tpi, tri, roughness, curvature, twi, spi, solar_proxy, hand_proxy)
+names(topo_stack) <- c("Elevation","Slope_deg","TPI","TRI","Roughness","Curvature","TWI","SPI","Solar_Proxy","HAND_proxy")
+all_structures <- bind_rows(struc_neg, struc_bur, struc_tai) %>% mutate(Period=factor(Period, levels=periods))
+topo_vals <- terra::extract(topo_stack, vect(all_structures), ID=FALSE)
+all_structures <- bind_cols(all_structures, topo_vals)
+soil_vals <- terra::extract(soil, vect(all_structures), ID=FALSE)
+all_structures$Soil_Quality  <- soil_vals[[1]]
+all_structures$Soil_Category <- cut(all_structures$Soil_Quality, breaks=c(0,2,4,6),
+  labels=c("Low (1-2)","Medium (3-4)","High (5-6)"), include.lowest=TRUE)
+all_sites      <- bind_rows(sites_neg, sites_bur, sites_tai) %>% mutate(Period=factor(Period, levels=periods))
+site_topo_vals <- terra::extract(topo_stack, vect(st_centroid(all_sites)), ID=FALSE)
+all_sites      <- bind_cols(all_sites, site_topo_vals)
+
+df_struct <- all_structures %>% st_drop_geometry() %>%
+  filter(!is.na(Elevation), !is.na(Slope_deg), !is.na(TWI), !is.na(TPI))
+```
+
+# 5. Bootstrap CI function and pairwise comparison sets
+
+```{r s05-bootstrap}
+boot_ci <- function(x, n_boot=10000, seed=42) {
+  x <- x[!is.na(x)]; n <- length(x)
+  if(n<3) return(data.frame(mean=mean(x),lo80=NA,hi80=NA,lo95=NA,hi95=NA,lo99=NA,hi99=NA,n=n))
+  set.seed(seed); bm <- replicate(n_boot, mean(sample(x,n,replace=TRUE)))
+  data.frame(mean=mean(x), lo80=quantile(bm,.10), hi80=quantile(bm,.90),
+    lo95=quantile(bm,.025), hi95=quantile(bm,.975),
+    lo99=quantile(bm,.005), hi99=quantile(bm,.995), n=n) }
+
+drennan_bullet <- function(df, y_var, y_label, title_text) {
+  df$x_pos <- as.numeric(factor(df$Period, levels=periods))
+  ggplot(df, aes(x=x_pos)) +
+    geom_segment(aes(xend=x_pos,y=lo99,yend=hi99), linewidth=1.5, lineend="butt", color="black") +
+    geom_segment(aes(xend=x_pos,y=lo95,yend=hi95), linewidth=4,   lineend="butt", color="black") +
+    geom_segment(aes(xend=x_pos,y=lo80,yend=hi80), linewidth=8,   lineend="butt", color="black") +
+    geom_point(aes(y=mean), shape=3, size=4,   stroke=1.5, color="white") +
+    geom_point(aes(y=mean), shape=3, size=3.5, stroke=1,   color="black") +
+    scale_x_continuous(breaks=1:3, labels=periods, limits=c(0.5,3.5)) +
+    labs(title=title_text, x="", y=y_label,
+      caption="Bars: 80% / 95% / 99% bootstrap CIs (10,000 resamples; Drennan 2009)") +
+    theme_bw() + theme(
+      plot.title         = element_text(face="bold", size=11, hjust=0.5, color="black"),
+      plot.caption       = element_text(size=7, color="black"),
+      axis.text          = element_text(color="black"),
+      axis.title         = element_text(color="black"),
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor   = element_blank()) }
+
+pairs_list <- list(c("Neguanje","Buritaca"), c("Buritaca","Tairona"), c("Neguanje","Tairona"))
+```
+
+# 6. MCE setup and population parameters
+
+```{r s06-mce-and-params}
+
+classify_suitability <- function(slope, twi, solar, hand, soil,
+                                  slope_threshold = 15, twi_min = 5, hand_max = 100) {
+  s_slope <- ifelse(slope <= slope_threshold, 1 - (slope / slope_threshold), 0)
+  s_twi   <- ifelse(twi >= twi_min, pmin((twi - twi_min) / (15 - twi_min), 1), 0)
+  s_solar <- solar
+  s_hand  <- ifelse(hand <= hand_max, 1 - (hand / hand_max), 0)
+  s_soil  <- ifelse(!is.na(soil), soil / 6, 0.5)
+  0.30 * s_slope + 0.25 * s_twi + 0.15 * s_solar + 0.15 * s_hand + 0.15 * s_soil
+}
+
+scenarios <- list(
+  Neguanje = list(slope_threshold = 12, twi_min = 6, hand_max = 80,  label = "Conservative"),
+  Buritaca = list(slope_threshold = 20, twi_min = 4, hand_max = 120, label = "Moderate"),
+  Tairona  = list(slope_threshold = 30, twi_min = 3, hand_max = 200, label = "Intensive")
+)
+
+slope_v <- values(slope_deg, na.rm=FALSE); twi_v <- values(twi, na.rm=FALSE)
+solar_v <- values(solar_proxy, na.rm=FALSE); hand_v <- values(hand_proxy, na.rm=FALSE)
+soil_v  <- values(soil, na.rm=FALSE)
+
+suit_rasters <- list(); suit_summary <- list()
+for (period in periods) {
+  sc <- scenarios[[period]]
+  sv <- classify_suitability(slope_v, twi_v, solar_v, hand_v, soil_v,
+    sc$slope_threshold, sc$twi_min, sc$hand_max)
+  sr <- dem[[1]]; values(sr) <- sv; names(sr) <- paste0("Suit_", period)
+  suit_rasters[[period]] <- sr
+  h <- sum(sv >= 0.6, na.rm=TRUE); m <- sum(sv >= 0.3 & sv < 0.6, na.rm=TRUE)
+  l <- sum(sv < 0.3, na.rm=TRUE); tt <- sum(!is.na(sv)); cha <- prod(res(dem)) / 10000
+  suit_summary[[period]] <- tibble(
+    Period=period, Scenario=sc$label,
+    Slope_Threshold=sc$slope_threshold, TWI_min=sc$twi_min, HAND_max=sc$hand_max,
+    High_ha=round(h*cha,1), Medium_ha=round(m*cha,1), Low_ha=round(l*cha,1),
+    Pct_High=round(100*h/tt,1), Pct_Medium=round(100*m/tt,1),
+    Total_Cultivable_ha=round((h+m)*cha,1))
+}
+table3_mce <- bind_rows(suit_summary)
+
+hh_low          <- 5
+hh_mid          <- 8
+hh_high         <- 10
+berrey_error_80 <- 0.382
+
+pop_estimates <- all_structures %>% st_drop_geometry() %>%
+  group_by(Period) %>%
+  summarise(N_structures = n(), .groups = "drop") %>%
+  mutate(
+    Pop_low      = N_structures * hh_low,
+    Pop_mid      = N_structures * hh_mid,
+    Pop_high     = N_structures * hh_high,
+    Pop_mid_lo80 = round(Pop_mid * (1 - berrey_error_80)),
+    Pop_mid_hi80 = round(Pop_mid * (1 + berrey_error_80))
+  )
+```
+
+# 7. Table 1. TWI proxy validation against derived drainage network
+
+```{r s07-table1-twi-validation}
+
+twi_raw   <- values(twi, na.rm=FALSE)[,1]
+fa_raw    <- values(flow_acc, na.rm=FALSE)[,1]
+slope_raw <- values(slope_deg, na.rm=FALSE)[,1]
+valid     <- !is.na(twi_raw) & !is.na(fa_raw) & !is.na(slope_raw)
+
+twi_vals       <- twi_raw[valid]
+fa_vals        <- fa_raw[valid]
+slope_vals_all <- slope_raw[valid]
+
+fa_threshold_95 <- quantile(fa_vals, 0.95, na.rm=TRUE)
+fa_threshold_99 <- quantile(fa_vals, 0.99, na.rm=TRUE)
+is_drainage_95  <- fa_vals >= fa_threshold_95
+is_drainage_99  <- fa_vals >= fa_threshold_99
+is_hillslope    <- fa_vals <= median(fa_vals, na.rm=TRUE)
+
+twi_validation <- data.frame(
+  Category   = c("All cells", "Top 5% flow_acc (drainage)",
+                 "Top 1% flow_acc (main channels)", "Bottom 50% flow_acc (hillslopes)"),
+  N_cells    = c(length(twi_vals), sum(is_drainage_95), sum(is_drainage_99), sum(is_hillslope)),
+  TWI_mean   = round(c(mean(twi_vals), mean(twi_vals[is_drainage_95]),
+                       mean(twi_vals[is_drainage_99]), mean(twi_vals[is_hillslope])), 3),
+  TWI_sd     = round(c(sd(twi_vals), sd(twi_vals[is_drainage_95]),
+                       sd(twi_vals[is_drainage_99]), sd(twi_vals[is_hillslope])), 3),
+  Slope_mean = round(c(mean(slope_vals_all), mean(slope_vals_all[is_drainage_95]),
+                       mean(slope_vals_all[is_drainage_99]), mean(slope_vals_all[is_hillslope])), 2)
+)
+
+cor_twi_fa <- suppressWarnings(cor.test(twi_vals, log(fa_vals + 1), method="spearman"))
+cor_rho    <- unname(cor_twi_fa$estimate)
+cor_p      <- cor_twi_fa$p.value
+
+knitr::kable(twi_validation,
+  caption = paste0("Table 1. TWI Proxy Validation - TWI values by flow accumulation class. ",
+                   "Spearman rho (TWI vs log[flow_acc]) = ",
+                   round(cor_rho, 4), "; p ", ifelse(cor_p < 0.001, "< 0.001",
+                   format(round(cor_p, 4))), "."),
+  align = "c", col.names = c("Category","N cells","TWI mean","TWI SD","Mean slope (°)"))
+```
+
+# 8. Figure 3. Terrain surface atlas
+
+```{r s08-fig3-terrain}
+
+r2df <- function(r,v){df<-as.data.frame(r,xy=TRUE,na.rm=TRUE);colnames(df)[3]<-v;df}
+df_slope <- r2df(slope_deg,"slope"); df_tpi   <- r2df(tpi,"TPI");   df_twi  <- r2df(twi,"TWI")
+df_curv  <- r2df(curvature,"curvature"); df_solar <- r2df(solar_proxy,"solar")
+df_spi   <- r2df(spi,"SPI"); df_hand  <- r2df(hand_proxy,"HAND"); df_rough <- r2df(roughness,"roughness")
+
+df_hs <- as.data.frame(hillshade, xy=TRUE, na.rm=TRUE)
+colnames(df_hs)[3] <- "hs"
+df_hs$hs_norm <- (df_hs$hs - min(df_hs$hs, na.rm=TRUE)) /
+  (max(df_hs$hs, na.rm=TRUE) - min(df_hs$hs, na.rm=TRUE))
+
+df_hist <- all_structures %>% st_drop_geometry()
+
+bmt <- theme_bw() + theme(
+  plot.title        = element_text(face="bold", size=10, color="black"),
+  axis.text         = element_blank(),
+  axis.ticks        = element_blank(),
+  axis.title        = element_blank(),
+  plot.margin       = margin(t=5, r=5, b=2, l=5),
+  legend.key.height = unit(0.4,"cm"),
+  legend.key.width  = unit(0.3,"cm"),
+  legend.text       = element_text(size=6, color="black"),
+  legend.title      = element_text(size=7, color="black"))
+
+add_map_decorations <- function(p) {
+  p + geom_raster(data=df_hs, aes(x=x, y=y, alpha=hs_norm), fill="black", show.legend=FALSE) +
+    scale_alpha_continuous(range=c(0.6, 0), guide="none") +
+    geom_sf(data=survey_sf, fill=NA, color="black", linewidth=0.6) +
+    coord_sf(datum=NA) +
+    ggspatial::annotation_north_arrow(
+      location="tl", style=north_arrow_fancy_orienteering(),
+      height=unit(0.7,"cm"), width=unit(0.7,"cm")) +
+    ggspatial::annotation_scale(
+      location="br", unit_category="metric",
+      text_cex=0.5, text_col="black", line_col="black")
+}
+
+make_hist <- function(data, var, x_label, fill_scale) {
+  d     <- data[!is.na(data[[var]]), ]
+  n_tot <- nrow(d)
+  ggplot(d, aes(x = .data[[var]])) +
+    geom_histogram(aes(y = after_stat(count), fill = after_stat(x)),
+                   bins = 20, color = "black", linewidth = 0.2) +
+    scale_y_continuous(name="Count",
+                       sec.axis=sec_axis(~ . / n_tot, name="Prop.")) +
+    labs(x = x_label) +
+    fill_scale +
+    theme_bw() +
+    theme(plot.margin          = margin(t=0, r=5, b=5, l=5),
+          axis.text            = element_text(size=7, color="black"),
+          axis.title           = element_text(size=8, color="black"),
+          axis.title.y.right   = element_text(angle=270, vjust=1.5),
+          panel.grid.minor     = element_blank())
+}
+
+tpi_lims   <- c(quantile(df_tpi$TPI,         0.02, na.rm=TRUE), quantile(df_tpi$TPI,         0.98, na.rm=TRUE))
+curv_lims  <- c(quantile(df_curv$curvature,  0.02, na.rm=TRUE), quantile(df_curv$curvature,  0.98, na.rm=TRUE))
+rough_lims <- c(0, quantile(df_rough$roughness, 0.98, na.rm=TRUE))
+
+p3a <- add_map_decorations(ggplot()+geom_raster(data=df_slope,aes(x=x,y=y,fill=slope))+scale_fill_viridis_c(option="viridis",name="Degrees")+labs(title="A. Slope")+bmt)
+h_slope <- make_hist(df_hist,"Slope_deg","Slope (°)",scale_fill_viridis_c(option="viridis",guide="none"))
+
+p3b <- add_map_decorations(ggplot()+geom_raster(data=df_tpi,aes(x=x,y=y,fill=TPI))+scale_fill_gradientn(colors=c("#053061","#4393c3","#f7f7f7","#d6604d","#67001f"),limits=tpi_lims,oob=scales::squish,name="TPI")+labs(title="B. TPI")+bmt)
+h_tpi <- make_hist(df_hist,"TPI","TPI",scale_fill_gradientn(colors=c("#053061","#4393c3","#f7f7f7","#d6604d","#67001f"),limits=tpi_lims,oob=scales::squish,guide="none"))
+
+p3c <- add_map_decorations(ggplot()+geom_raster(data=df_twi,aes(x=x,y=y,fill=TWI))+scale_fill_viridis_c(option="mako",direction=-1,name="TWI")+labs(title="C. TWI")+bmt)
+h_twi <- make_hist(df_hist,"TWI","TWI",scale_fill_viridis_c(option="mako",direction=-1,guide="none"))
+
+p3d <- add_map_decorations(ggplot()+geom_raster(data=df_curv,aes(x=x,y=y,fill=curvature))+scale_fill_gradient2(low="#762a83",mid="white",high="#1b7837",midpoint=0,name="Curv",limits=curv_lims,oob=scales::squish)+labs(title="D. Curvature")+bmt)
+h_curv <- make_hist(df_hist,"Curvature","Curvature",scale_fill_gradient2(low="#762a83",mid="white",high="#1b7837",midpoint=0,limits=curv_lims,oob=scales::squish,guide="none"))
+
+p3e <- add_map_decorations(ggplot()+geom_raster(data=df_solar,aes(x=x,y=y,fill=solar))+scale_fill_viridis_c(option="plasma",name="PISRI")+labs(title="E. Solar Radiation")+bmt)
+h_solar <- make_hist(df_hist,"Solar_Proxy","PISRI",scale_fill_viridis_c(option="plasma",guide="none"))
+
+p3f <- add_map_decorations(ggplot()+geom_raster(data=df_spi,aes(x=x,y=y,fill=SPI))+scale_fill_viridis_c(option="rocket",direction=-1,name="SPI")+labs(title="F. Stream Power")+bmt)
+h_spi <- make_hist(df_hist,"SPI","SPI",scale_fill_viridis_c(option="rocket",direction=-1,guide="none"))
+
+p3g <- add_map_decorations(ggplot()+geom_raster(data=df_hand,aes(x=x,y=y,fill=HAND))+scale_fill_viridis_c(option="cividis",name="m")+labs(title="G. HAND")+bmt)
+h_hand <- make_hist(df_hist,"HAND_proxy","HAND (m)",scale_fill_viridis_c(option="cividis",guide="none"))
+
+p3h <- add_map_decorations(ggplot()+geom_raster(data=df_rough,aes(x=x,y=y,fill=roughness))+scale_fill_viridis_c(option="magma",name="Rough",limits=rough_lims,oob=scales::squish)+labs(title="H. Roughness")+bmt)
+h_rough <- make_hist(df_hist,"Roughness","Roughness",scale_fill_viridis_c(option="magma",limits=rough_lims,oob=scales::squish,guide="none"))
+
+col1 <- (p3a / h_slope) + plot_layout(heights=c(4,1))
+col2 <- (p3b / h_tpi)   + plot_layout(heights=c(4,1))
+col3 <- (p3e / h_solar) + plot_layout(heights=c(4,1))
+col4 <- (p3f / h_spi)   + plot_layout(heights=c(4,1))
+col5 <- (p3c / h_twi)   + plot_layout(heights=c(4,1))
+col6 <- (p3d / h_curv)  + plot_layout(heights=c(4,1))
+col7 <- (p3g / h_hand)  + plot_layout(heights=c(4,1))
+col8 <- (p3h / h_rough) + plot_layout(heights=c(4,1))
+
+fig2 <- ((col1|col2|col3|col4) / (col5|col6|col7|col8)) +
+  plot_annotation(title="Figure 3. Terrain Surface Atlas of the Río Frío Basin",
+    theme=theme(plot.title=element_text(face="bold",size=15,hjust=0.5,color="black")))
+print(fig2)
+
+```
+
+# 9. Figure 4. Topographic density distributions by period
+
+```{r s09-fig4-density}
+
+p4a <- ggplot(df_struct,aes(x=Elevation,fill=Period,color=Period))+
+  geom_density(alpha=0.3,linewidth=0.8)+
+  scale_fill_manual(values=period_colors)+scale_color_manual(values=period_colors)+
+  labs(title="A. Elevation",x="Elevation (m)",y="Density")+
+  theme_bw()+theme(legend.position="bottom",
+    plot.title=element_text(face="bold",size=10,color="black"),
+    axis.text=element_text(color="black"), axis.title=element_text(color="black"),
+    legend.text=element_text(color="black"), legend.title=element_text(color="black"))
+
+p4b <- ggplot(df_struct,aes(x=Slope_deg,fill=Period,color=Period))+
+  geom_density(alpha=0.3,linewidth=0.8)+
+  scale_fill_manual(values=period_colors)+scale_color_manual(values=period_colors)+
+  geom_vline(xintercept=c(12,20,30),linetype=c("dotted","dashed","solid"),
+             color="gray40",linewidth=0.5)+
+  labs(title="B. Slope",x="Slope (°)",y="Density")+
+  theme_bw()+theme(legend.position="bottom",
+    plot.title=element_text(face="bold",size=10,color="black"),
+    axis.text=element_text(color="black"), axis.title=element_text(color="black"),
+    legend.text=element_text(color="black"), legend.title=element_text(color="black"))
+
+p4c <- ggplot(df_struct,aes(x=TWI,fill=Period,color=Period))+
+  geom_density(alpha=0.3,linewidth=0.8)+
+  scale_fill_manual(values=period_colors)+scale_color_manual(values=period_colors)+
+  labs(title="C. TWI",x="TWI",y="Density")+
+  theme_bw()+theme(legend.position="bottom",
+    plot.title=element_text(face="bold",size=10,color="black"),
+    axis.text=element_text(color="black"), axis.title=element_text(color="black"),
+    legend.text=element_text(color="black"), legend.title=element_text(color="black"))
+
+p4d <- ggplot(df_struct,aes(x=TPI,fill=Period,color=Period))+
+  geom_density(alpha=0.3,linewidth=0.8)+
+  scale_fill_manual(values=period_colors)+scale_color_manual(values=period_colors)+
+  geom_vline(xintercept=0,linetype="dashed",color="gray50")+
+  labs(title="D. TPI",x="TPI",y="Density")+
+  theme_bw()+theme(legend.position="bottom",
+    plot.title=element_text(face="bold",size=10,color="black"),
+    axis.text=element_text(color="black"), axis.title=element_text(color="black"),
+    legend.text=element_text(color="black"), legend.title=element_text(color="black"))
+
+fig3 <- (p4a|p4b)/(p4c|p4d)+
+  plot_annotation(title="Figure 4. Kernel Density Distributions by Archaeological Period",
+    theme=theme(plot.title=element_text(face="bold",size=13,hjust=0.5,color="black")))
+print(fig3)
+```
+
+# 10. Figure 5. Collinearity assessment
+
+```{r s10-fig5-collinearity}
+
+pca_vars <- c("Slope_deg", "TPI", "TRI", "Roughness", "TWI", "SPI",
+              "Solar_Proxy", "HAND_proxy", "Elevation")
+
+df_corr <- df_struct %>%
+  dplyr::select(all_of(pca_vars)) %>%
+  filter(complete.cases(.))
+
+cor_pearson  <- cor(df_corr, method = "pearson")
+
+corrplot::corrplot(
+  cor_pearson,
+  method      = "color",
+  type        = "upper",
+  order       = "hclust",
+  addCoef.col = "black",
+  number.cex  = 0.60,
+  tl.col      = "black",
+  tl.cex      = 0.80,
+  col         = colorRampPalette(c("#4575b4", "white", "#d73027"))(200),
+  title       = "Figure 5. Pearson correlation matrix for topographic covariates",
+  mar         = c(0, 0, 2, 0)
+)
+
+vif_all <- sapply(pca_vars, function(v) {
+  others <- setdiff(pca_vars, v)
+  fmla   <- as.formula(paste(v, "~", paste(others, collapse = " + ")))
+  mod    <- lm(fmla, data = df_corr)
+  1 / (1 - summary(mod)$r.squared)
+})
+
+vif_df <- tibble(Variable = names(vif_all), VIF = round(vif_all, 2)) %>%
+  arrange(desc(VIF))
+```
+
+# 11. Figures 6 and 7. Rhohat structure intensity vs topographic covariates
+
+```{r s11-fig6-7-rhohat}
+
+make_owin_from_sf <- function(x) {
+  tryCatch(
+    spatstat.geom::as.owin(x),
+    error = function(e1) {
+      tryCatch(
+        spatstat.geom::as.owin(sf::as_Spatial(x)),
+        error = function(e2) spatstat.geom::as.owin(as(x, "Spatial"))
+      )
+    }
+  )
+}
+
+make_ppp_from_sf <- function(x, window) {
+  coords <- sf::st_coordinates(x)
+  if (nrow(coords) == 0) stop("No coordinates available for point-pattern conversion.")
+  inside <- spatstat.geom::inside.owin(coords[, 1], coords[, 2], window)
+  coords <- coords[inside, , drop = FALSE]
+  spatstat.geom::ppp(x = coords[, 1], y = coords[, 2], window = window, check = FALSE)
+}
+
+make_im_from_raster <- function(r) {
+  m <- terra::as.matrix(r, wide = TRUE)
+  e <- terra::ext(r)
+  spatstat.geom::im(
+    mat    = t(m[nrow(m):1, , drop = FALSE]),
+    xrange = c(e[1], e[2]),
+    yrange = c(e[3], e[4])
+  )
+}
+
+rhohat_peak <- function(rh, obs_values, trim = 0.05) {
+  d <- as.data.frame(rh)
+  rho_col <- intersect(c("rho", "rhohat", "estimate"), names(d))[1]
+  if (is.na(rho_col)) rho_col <- names(d)[sapply(d, is.numeric)][2]
+  cov_col <- intersect(c("covariate", "x", "r"), names(d))[1]
+  if (is.na(cov_col)) cov_col <- names(d)[sapply(d, is.numeric)][1]
+  valid <- is.finite(d[[rho_col]]) & is.finite(d[[cov_col]])
+  d <- d[valid, , drop = FALSE]
+  obs_values <- obs_values[is.finite(obs_values)]
+  q <- stats::quantile(obs_values, probs = c(trim, 1 - trim), na.rm = TRUE)
+  d_central <- d[d[[cov_col]] >= q[1] & d[[cov_col]] <= q[2], , drop = FALSE]
+  if (nrow(d_central) < 3) d_central <- d
+  idx <- which.max(d_central[[rho_col]])
+  tibble(
+    Central_Support_Low = as.numeric(q[1]),
+    Central_Support_High = as.numeric(q[2]),
+    Central_Peak_Value = d_central[[cov_col]][idx],
+    Peak_Intensity = d_central[[rho_col]][idx]
+  )
+}
+
+rhohat_observed_support <- function(x, trim = 0.05) {
+  x <- x[is.finite(x)]
+  q <- stats::quantile(x, probs = c(trim, 0.25, 0.50, 0.75, 1 - trim), na.rm = TRUE)
+  tibble(
+    N = length(x),
+    Mean = mean(x, na.rm = TRUE),
+    Median = unname(q[3]),
+    Q05 = unname(q[1]),
+    Q25 = unname(q[2]),
+    Q75 = unname(q[4]),
+    Q95 = unname(q[5]),
+    Min = min(x, na.rm = TRUE),
+    Max = max(x, na.rm = TRUE)
+  )
+}
+
+survey_owin <- make_owin_from_sf(survey_sf)
+
+rhohat_vars   <- c("Slope_deg", "Elevation", "TWI", "TPI")
+rhohat_labels <- c("Slope (degrees)", "Elevation (m)", "TWI", "TPI")
+raster_for_rhohat <- list(
+  Slope_deg = slope_deg,
+  Elevation = dem,
+  TWI       = twi,
+  TPI       = tpi
+)
+im_list <- lapply(raster_for_rhohat, make_im_from_raster)
+
+all_rho_sf <- all_structures %>%
+  filter(!is.na(Slope_deg), !is.na(Elevation), !is.na(TWI), !is.na(TPI))
+pp_all <- make_ppp_from_sf(all_rho_sf, survey_owin)
+
+par(mfrow = c(2, 2), mar = c(4, 4, 3, 1), oma = c(0, 0, 3, 0))
+rhohat_results_all <- list()
+for (i in seq_along(rhohat_vars)) {
+  v   <- rhohat_vars[i]
+  lab <- rhohat_labels[i]
+  rh  <- spatstat.explore::rhohat(pp_all, im_list[[v]], confidence = 0.95, smoother = "kernel")
+  rhohat_results_all[[v]] <- rh
+  plot(rh, main = paste("Rhohat:", lab, "(all periods)"),
+       xlab = lab, ylab = "Intensity", legend = FALSE)
+}
+mtext("Figure 6. Rhohat: structure intensity vs topographic covariates (all periods pooled)",
+      side = 3, outer = TRUE, line = 1.0, cex = 1.0, font = 2)
+
+par(mfrow = c(3, 4), mar = c(3.8, 3.8, 2.8, 1), oma = c(0, 0, 3, 0))
+rhohat_results_period <- list()
+for (p in periods) {
+  struc_p <- all_structures %>%
+    filter(Period == p, !is.na(Slope_deg), !is.na(Elevation), !is.na(TWI), !is.na(TPI))
+  pp_p <- make_ppp_from_sf(struc_p, survey_owin)
+  rhohat_results_period[[p]] <- list()
+  for (i in seq_along(rhohat_vars)) {
+    v   <- rhohat_vars[i]
+    lab <- rhohat_labels[i]
+    rh  <- spatstat.explore::rhohat(pp_p, im_list[[v]], confidence = 0.95, smoother = "kernel")
+    rhohat_results_period[[p]][[v]] <- rh
+    plot(rh, main = paste(p, ":", lab), xlab = lab, ylab = "Intensity", legend = FALSE)
+  }
+}
+mtext("Figure 7. Rhohat by period: structure intensity vs topographic covariates",
+      side = 3, outer = TRUE, line = 1.0, cex = 1.0, font = 2)
+
+rhohat_peak_table_all <- bind_rows(lapply(rhohat_vars, function(v) {
+  rhohat_peak(rhohat_results_all[[v]], obs_values = df_struct[[v]]) %>%
+    mutate(Covariate = v, .before = 1)
+}))
+
+rhohat_support_all <- bind_rows(lapply(rhohat_vars, function(v) {
+  rhohat_observed_support(df_struct[[v]]) %>%
+    mutate(Covariate = v, .before = 1)
+}))
+
+rhohat_peak_table_period <- bind_rows(lapply(periods, function(p) {
+  bind_rows(lapply(rhohat_vars, function(v) {
+    obs_p <- df_struct[[v]][df_struct$Period == p]
+    rhohat_peak(rhohat_results_period[[p]][[v]], obs_values = obs_p) %>%
+      mutate(Period = p, Covariate = v, .before = 1)
+  }))
+}))
+```
+
+# 12. Figure 8 and Table 2. Inhomogeneous Ripley's K/L and spatial diagnostics
+
+```{r s12-fig8-kinhom}
+
+r_max <- 2000
+r_seq <- seq(0, r_max, by = 50)
+n_sim <- 999
+
+kinhom_env_list <- list()
+linhom_env_list <- list()
+kinhom_bw_table <- list()
+
+par(mfrow = c(2, 3), mar = c(4, 4, 3, 1), oma = c(0, 0, 3, 0))
+for (p in periods) {
+  struc_p <- all_structures %>%
+    filter(Period == p, !is.na(Slope_deg), !is.na(Elevation), !is.na(TWI), !is.na(TPI))
+  pp_p <- make_ppp_from_sf(struc_p, survey_owin)
+  bw_p <- spatstat.explore::bw.diggle(pp_p)
+  lambda_p <- spatstat.explore::density.ppp(pp_p, sigma = bw_p, positive = TRUE)
+  kinhom_bw_table[[p]] <- tibble(Period = p, N = pp_p$n, Diggle_Bandwidth_m = as.numeric(bw_p))
+  env_p <- spatstat.explore::envelope(
+    pp_p, fun = spatstat.explore::Kinhom, nsim = n_sim, r = r_seq,
+    simulate = expression(spatstat.random::rpoispp(lambda_p)),
+    correction = "border", verbose = FALSE
+  )
+  kinhom_env_list[[p]] <- env_p
+  plot(env_p,
+       main = sprintf("Kinhom: %s (N=%d)", p, pp_p$n),
+       xlab = "r (m)", ylab = expression(K[inhom](r)), legend = FALSE)
+}
+for (p in periods) {
+  struc_p <- all_structures %>%
+    filter(Period == p, !is.na(Slope_deg), !is.na(Elevation), !is.na(TWI), !is.na(TPI))
+  pp_p <- make_ppp_from_sf(struc_p, survey_owin)
+  bw_p <- spatstat.explore::bw.diggle(pp_p)
+  lambda_p <- spatstat.explore::density.ppp(pp_p, sigma = bw_p, positive = TRUE)
+  env_l_p <- spatstat.explore::envelope(
+    pp_p, fun = spatstat.explore::Linhom, nsim = n_sim, r = r_seq,
+    simulate = expression(spatstat.random::rpoispp(lambda_p)),
+    correction = "border", verbose = FALSE
+  )
+  linhom_env_list[[p]] <- env_l_p
+  plot(env_l_p, . - r ~ r,
+       main = sprintf("Linhom - r: %s (N=%d)", p, pp_p$n),
+       xlab = "r (m)", ylab = expression(L[inhom](r) - r), legend = FALSE)
+  abline(h = 0, lty = 2)
+}
+mtext("Figure 8. Inhomogeneous Ripley's K and centered L-function by period",
+      side = 3, outer = TRUE, line = 1.0, cex = 1.0, font = 2)
+
+kinhom_bw_df <- bind_rows(kinhom_bw_table)
+
+kinhom_summary <- bind_rows(lapply(periods, function(p) {
+  env_l <- linhom_env_list[[p]]
+  obs_centered <- env_l$obs - env_l$r
+  hi_centered  <- env_l$hi - env_l$r
+  lo_centered  <- env_l$lo - env_l$r
+  r_vals       <- env_l$r
+  valid <- is.finite(obs_centered) & is.finite(hi_centered) & is.finite(lo_centered)
+  above <- r_vals[valid & obs_centered > hi_centered]
+  below <- r_vals[valid & obs_centered < lo_centered]
+  tibble(
+    Period = p,
+    Bands_Evaluated = sum(valid),
+    Clustering_Bands = length(above),
+    Clustering_Min_m = ifelse(length(above) > 0, min(above), NA_real_),
+    Clustering_Max_m = ifelse(length(above) > 0, max(above), NA_real_),
+    Inhibition_Bands = length(below),
+    Inhibition_Min_m = ifelse(length(below) > 0, min(below), NA_real_),
+    Inhibition_Max_m = ifelse(length(below) > 0, max(below), NA_real_)
+  )
+}))
+
+kinhom_summary <- kinhom_summary %>%
+  mutate(
+    Residual_Clustering_Assessment = case_when(
+      Clustering_Bands == 0 ~ "No residual clustering",
+      Clustering_Bands == 1 & Clustering_Min_m <= r_seq[2] ~ "Single first-distance band; not robust",
+      TRUE ~ "Residual clustering across multiple bands"
+    ),
+    Residual_Inhibition_Assessment = case_when(
+      Inhibition_Bands == 0 ~ "No residual inhibition",
+      Inhibition_Bands == 1 & Inhibition_Min_m <= r_seq[2] ~ "Single first-distance band; not robust",
+      TRUE ~ "Residual inhibition across multiple bands"
+    )
+  )
+
+rhohat_peaks_wide <- rhohat_peak_table_period %>%
+  select(Period, Covariate, Central_Peak_Value) %>%
+  pivot_wider(names_from = Period, values_from = Central_Peak_Value,
+              names_prefix = "Peak_")
+
+table4_base <- tibble(Variable = c("Slope_deg", "Elevation", "TWI", "TPI")) %>%
+  left_join(vif_df %>% select(Variable, VIF), by = "Variable") %>%
+  left_join(rhohat_peak_table_all %>%
+              mutate(Peak_Pooled = round(Central_Peak_Value, 1)) %>%
+              select(Covariate, Peak_Pooled),
+            by = c("Variable" = "Covariate")) %>%
+  left_join(rhohat_peaks_wide, by = c("Variable" = "Covariate")) %>%
+  mutate(across(starts_with("Peak_"), ~round(., 1)))
+
+knitr::kable(
+  table4_base,
+  caption = paste0(
+    "Table 2. Covariate assessment and spatial diagnostics. ",
+    "VIF = Variance Inflation Factor. ",
+    "Rhohat peaks = covariate values at maximum structure intensity within Q05-Q95 observed support."),
+  align = "lccccc",
+  col.names = c("Variable", "VIF", "Peak (pooled)",
+                "Peak (Neguanje)", "Peak (Buritaca)", "Peak (Tairona)"),
+  format.args = list(big.mark = ",")
+)
+```
+
+# 13. Table 3. MCE weight sensitivity analysis
+
+```{r s13-table3-mce-sensitivity}
+weight_schemes <- list(
+  Baseline = c(slope = 0.30, twi = 0.25, solar = 0.15, hand = 0.15, soil = 0.15),
+  Equal = c(slope = 0.20, twi = 0.20, solar = 0.20, hand = 0.20, soil = 0.20),
+  Slope_dom = c(slope = 0.40, twi = 0.20, solar = 0.15, hand = 0.15, soil = 0.10),
+  TWI_dom = c(slope = 0.20, twi = 0.40, solar = 0.15, hand = 0.15, soil = 0.10)
+)
+
+sr_list <- list()
+for (wn in names(weight_schemes)) {
+  w <- weight_schemes[[wn]]
+  for (p in periods) {
+    sc <- scenarios[[p]]
+    s_slope <- ifelse(slope_v <= sc$slope_threshold, 1 - (slope_v / sc$slope_threshold), 0)
+    s_twi <- ifelse(twi_v >= sc$twi_min, pmin((twi_v - sc$twi_min) / (15 - sc$twi_min), 1), 0)
+    s_solar <- solar_v
+    s_hand <- ifelse(hand_v <= sc$hand_max, 1 - (hand_v / sc$hand_max), 0)
+    s_soil <- ifelse(!is.na(soil_v), soil_v / 6, 0.5)
+    sv <- w["slope"] * s_slope + w["twi"] * s_twi + w["solar"] * s_solar +
+      w["hand"] * s_hand + w["soil"] * s_soil
+    hc <- sum(sv >= 0.3, na.rm = TRUE) * prod(res(dem)) / 10000
+    sr_list[[paste(wn, p)]] <- tibble(Weights = wn, Period = p, Cultivable_ha = round(hc, 1))
+  }
+}
+
+sens_long <- bind_rows(sr_list)
+sens_wide <- sens_long %>%
+  pivot_wider(names_from = Period, values_from = Cultivable_ha)
+
+table5 <- sens_long %>%
+  left_join(pop_estimates %>% select(Period, N_structures, Pop_mid), by = "Period") %>%
+  mutate(
+    Struct_per_ha = round(N_structures / Cultivable_ha, 2),
+    Density_mid = round(Pop_mid / Cultivable_ha, 1)
+  ) %>%
+  select(Weights, Period, Cultivable_ha, Struct_per_ha, Density_mid) %>%
+  arrange(factor(Weights, levels = c("Baseline","Equal","Slope_dom","TWI_dom")),
+          factor(Period, levels = periods))
+
+knitr::kable(
+  table5,
+  caption = paste0(
+    "Table 3. MCE weight sensitivity analysis. Cultivable hectares, ",
+    "structure density (structures per cultivable hectare, independent of household size), ",
+    "and population density (Pop mid = 8 pers/struct / cultivable ha) by period under ",
+    "four alternative MCE weight schemes."),
+  align = "llrrr",
+  format.args = list(big.mark = ","),
+  col.names = c("Weights", "Period", "Cult. ha", "Struct/ha", "Dens. mid"))
+```
+
+# 14. Table 4. MCE land suitability, population estimates and carrying capacity
+
+```{r s14-table4-core-results}
+
+mce_df <- table3_mce %>%
+  select(Period, Scenario, Slope_Threshold, TWI_min, HAND_max,
+         High_ha, Medium_ha, Total_Cultivable_ha, Pct_High, Pct_Medium)
+
+pop_estimates <- all_structures %>% st_drop_geometry() %>%
+  group_by(Period) %>%
+  summarise(N_structures = n(), .groups = "drop") %>%
+  mutate(
+    Pop_low      = N_structures * hh_low,
+    Pop_mid      = N_structures * hh_mid,
+    Pop_high     = N_structures * hh_high,
+    Pop_mid_lo80 = round(Pop_mid * (1 - berrey_error_80)),
+    Pop_mid_hi80 = round(Pop_mid * (1 + berrey_error_80))
+  )
+
+buffer_labels   <- c("30 min", "60 min", "90 min")
+time_thresholds <- c(30, 60, 90)
+
+cc_results <- list()
+for (period in periods) {
+  sr  <- suit_rasters[[period]]
+  ir  <- switch(period, Neguanje=iso_neg, Buritaca=iso_bur, Tairona=iso_tai)
+  pcc <- list()
+  for (b in seq_along(time_thresholds)) {
+    tl <- as.character(time_thresholds[b])
+    if (!is.null(ir) && tl %in% names(ir$isochrones)) {
+      ig <- ir$isochrones[[tl]]; bv <- vect(st_sf(geometry=ig))
+      sm <- tryCatch(crop(sr,bv)|>mask(bv), error=function(e) sr)
+    } else {
+      ssf <- switch(period, Neguanje=sites_neg, Buritaca=sites_bur, Tairona=sites_tai)
+      bm  <- c(1400, 2800, 4200)[b]
+      bg  <- st_buffer(st_centroid(ssf), dist=bm) %>% st_union() %>% st_make_valid()
+      bg  <- st_intersection(bg, survey_sf); bv <- vect(st_sf(geometry=bg))
+      sm  <- tryCatch(crop(sr,bv)|>mask(bv), error=function(e) sr)
+    }
+    svb <- values(sm, na.rm=TRUE); cha <- prod(res(sr))/10000
+    hh  <- sum(svb >= 0.6, na.rm=TRUE)*cha
+    hm  <- sum(svb >= 0.3 & svb < 0.6, na.rm=TRUE)*cha
+    pcc[[b]] <- tibble(Period=period, Buffer=buffer_labels[b],
+                       Accessible_ha=round(hh+hm,1), High_ha=round(hh,1))
+  }
+  cc_results[[period]] <- bind_rows(pcc)
+}
+cc_df <- bind_rows(cc_results)
+cc_df$Period <- factor(cc_df$Period, levels=periods)
+cc_df$Buffer <- factor(cc_df$Buffer, levels=buffer_labels)
+
+cc_90 <- cc_df %>% filter(Buffer == "90 min")
+
+pop_df <- pop_estimates %>%
+  left_join(cc_90 %>% select(Period, Accessible_ha), by = "Period") %>%
+  mutate(
+    Density_low  = round(Pop_low  / Accessible_ha, 1),
+    Density_mid  = round(Pop_mid  / Accessible_ha, 1),
+    Density_high = round(Pop_high / Accessible_ha, 1)
+  ) %>%
+  select(Period, N_structures, Pop_low, Pop_mid, Pop_high,
+         Pop_mid_lo80, Pop_mid_hi80, Accessible_ha, Density_mid)
+
+table2 <- data.frame(
+  Period       = pop_estimates$Period,
+  Scenario     = table3_mce$Scenario,
+  Cultivable_ha = table3_mce$Total_Cultivable_ha,
+  N_struct     = pop_estimates$N_structures,
+  Pop_range    = paste0(
+    formatC(pop_estimates$Pop_low,  format="d", big.mark=","), "-",
+    formatC(pop_estimates$Pop_high, format="d", big.mark=",")),
+  Pop_mid_CI   = paste0(
+    formatC(pop_estimates$Pop_mid,      format="d", big.mark=","), " [",
+    formatC(pop_estimates$Pop_mid_lo80, format="d", big.mark=","), "-",
+    formatC(pop_estimates$Pop_mid_hi80, format="d", big.mark=","), "]"),
+  Accessible_ha = pop_df$Accessible_ha,
+  Density_mid  = pop_df$Density_mid,
+  stringsAsFactors = FALSE
+)
+
+knitr::kable(table2,
+  caption = paste0(
+    "Table 4. MCE land suitability, population estimates, and carrying capacity by period. ",
+    "MCE weights: slope 0.30 | TWI 0.25 | solar radiation 0.15 | HAND 0.15 | soil 0.15. ",
+    "Scenario thresholds - Conservative (Neguanje): slope ≤ 12°, TWI ≥ 6, HAND ≤ 80 m; ",
+    "Moderate (Buritaca): slope ≤ 20°, TWI ≥ 4, HAND ≤ 120 m; ",
+    "Intensive (Tairona): slope ≤ 30°, TWI ≥ 3, HAND ≤ 200 m. ",
+    "Cultivable ha = MCE High + Medium (score ≥ 0.3) for the full 52.2 km² polygon. ",
+    "Population range = structures × 5-10 persons; Pop mid = structures × 8 persons (Berrey 2018); ",
+    "80% CI = mid ± 38.2% (Berrey 2018, Fig. 6). ",
+    "Accessible ha = cultivable land within the 90-min Tobler walking catchment. ",
+    "Density = Pop mid / Accessible ha."),
+  align = c("l","l","r","r","r","r","r","r"),
+  format.args = list(big.mark = ","),
+  col.names = c("Period", "Scenario", "Cultivable (ha)",
+                "N structures", "Pop range (low-high)",
+                "Pop mid [80% CI]", "Accessible ha (90 min)",
+                "Density (pers/ha)")
+)
+
+pop_cc_compare <- pop_estimates %>%
+  left_join(cc_90 %>% select(Period, Accessible_ha), by = "Period") %>%
+  mutate(
+    Density_low  = round(Pop_low  / Accessible_ha, 1),
+    Density_mid  = round(Pop_mid  / Accessible_ha, 1),
+    Density_high = round(Pop_high / Accessible_ha, 1))
+
+tai_to_neg <- round(pop_estimates$Pop_mid[3] / pop_estimates$Pop_mid[1], 1)
+tai_lo80   <- pop_estimates$Pop_mid_lo80[3]
+neg_hi80   <- pop_estimates$Pop_mid_hi80[1]
+bur_hi80   <- pop_estimates$Pop_mid_hi80[2]
+```
+
+# 15. Figure 9. Land suitability maps
+
+```{r s15-fig9-mce}
+
+make_suit_map <- function(sr, stf, ssf, pn, lab) {
+  ds <- as.data.frame(sr, xy=TRUE, na.rm=TRUE); colnames(ds)[3] <- "suit"
+  sc <- scenarios[[pn]]
+  ggplot() +
+    geom_raster(data=ds, aes(x=x, y=y, fill=suit)) +
+    scale_fill_gradientn(
+      colors=c("#d73027","#fc8d59","#fee08b","#d9ef8b","#1a9850"),
+      values=scales::rescale(c(0,0.2,0.4,0.6,0.8)), limits=c(0,1), name="Suit.") +
+    geom_sf(data=survey_sf, fill=NA, color="black", linetype="dashed", linewidth=0.6) +
+    geom_sf(data=ssf, fill=NA, color="white",  linewidth=0.5) +
+    geom_sf(data=stf, color="black", size=0.2, alpha=0.6) +
+    coord_sf(datum=NA) +
+    ggspatial::annotation_north_arrow(
+      location="tl", style=north_arrow_fancy_orienteering(),
+      height=unit(0.6,"cm"), width=unit(0.6,"cm")) +
+    ggspatial::annotation_scale(
+      location="br", unit_category="metric",
+      text_col="black", line_col="black") +
+    labs(title=paste0(lab, ". ", pn),
+         subtitle=paste0("Slope ≤ ",sc$slope_threshold,"° | TWI ≥ ",sc$twi_min,
+                         " | HAND ≤ ",sc$hand_max," m")) +
+    theme_bw() + theme(
+      legend.position = "right",
+      plot.title      = element_text(face="bold", size=10, hjust=0.5, color="black"),
+      plot.subtitle   = element_text(size=7, hjust=0.5, color="black"),
+      axis.text       = element_blank(),
+      axis.ticks      = element_blank(),
+      axis.title      = element_blank(),
+      legend.text     = element_text(color="black"),
+      legend.title    = element_text(color="black"))
+}
+
+fig4 <- make_suit_map(suit_rasters$Neguanje, struc_neg, sites_neg, "Neguanje", "A") |
+        make_suit_map(suit_rasters$Buritaca,  struc_bur, sites_bur, "Buritaca", "B") |
+        make_suit_map(suit_rasters$Tairona,   struc_tai, sites_tai, "Tairona",  "C")
+print(fig4)
+
+```
+
+# 16. Figure 10. Terrain diversification
+
+```{r s16-fig10-diversification}
+
+df_nci <- all_structures %>% st_drop_geometry() %>%
+  filter(!is.na(Slope_deg), !is.na(TWI)) %>%
+  mutate(Terrain_Class = factor(case_when(
+    Slope_deg <= 12 & TWI >= 6 ~ "Gentle + Moist",
+    Slope_deg <= 12 & TWI <  6 ~ "Gentle + Dry",
+    Slope_deg <= 20 & TWI >= 4 ~ "Moderate slope",
+    Slope_deg <= 30 & TWI >= 3 ~ "Steep (terracing likely)",
+    TRUE                        ~ "Very steep (extreme)"),
+    levels=c("Gentle + Moist","Gentle + Dry","Moderate slope",
+             "Steep (terracing likely)","Very steep (extreme)")))
+
+nci_summary <- df_nci %>%
+  group_by(Period, Terrain_Class) %>% summarise(n=n(), .groups="drop") %>%
+  group_by(Period) %>% mutate(pct = n / sum(n))
+
+p6a <- ggplot(nci_summary, aes(x=Terrain_Class, y=pct, fill=Period)) +
+  geom_col(position=position_dodge(width=0.7), width=0.6, color="black", linewidth=0.3) +
+  scale_fill_manual(values=period_colors) +
+  scale_y_continuous(labels=scales::percent, expand=expansion(mult=c(0, 0.05))) +
+  labs(title="A. Terrain Class Distribution", x="", y="Proportion") +
+  theme_bw() + theme(
+    plot.title         = element_text(face="bold", size=11, hjust=0.5, color="black"),
+    legend.position    = "bottom",
+    axis.text.x        = element_text(angle=25, hjust=1, size=8, color="black"),
+    axis.text.y        = element_text(color="black"),
+    axis.title         = element_text(color="black"),
+    legend.text        = element_text(color="black"),
+    legend.title       = element_text(color="black"),
+    panel.grid.major.x = element_blank())
+
+boot_slope <- bind_rows(lapply(periods, function(p) cbind(Period=p, boot_ci(df_nci$Slope_deg[df_nci$Period==p]))))
+boot_slope$Period <- factor(boot_slope$Period, levels=periods)
+p6b <- drennan_bullet(boot_slope, "Slope", "Mean Slope (°)", "B. Slope")
+
+boot_twi_b <- bind_rows(lapply(periods, function(p) cbind(Period=p, boot_ci(df_nci$TWI[df_nci$Period==p]))))
+boot_twi_b$Period <- factor(boot_twi_b$Period, levels=periods)
+p6c <- drennan_bullet(boot_twi_b, "TWI", "Mean TWI", "C. TWI")
+
+boot_elev <- bind_rows(lapply(periods, function(p) cbind(Period=p, boot_ci(df_nci$Elevation[df_nci$Period==p]))))
+boot_elev$Period <- factor(boot_elev$Period, levels=periods)
+p6d <- drennan_bullet(boot_elev, "Elevation", "Mean Elev (m)", "D. Elevation")
+
+fig5 <- p6a / (p6b | p6c | p6d) + plot_layout(heights=c(1.2,1))
+print(fig5)
+
+nci_wide <- nci_summary %>% select(Period, Terrain_Class, pct) %>%
+  pivot_wider(names_from=Period, values_from=pct)
+
+neg_vsteep <- nci_wide$Neguanje[nci_wide$Terrain_Class=="Very steep (extreme)"]
+bur_vsteep <- nci_wide$Buritaca[nci_wide$Terrain_Class=="Very steep (extreme)"]
+tai_vsteep <- nci_wide$Tairona[nci_wide$Terrain_Class=="Very steep (extreme)"]
+tai_gd     <- nci_wide$Tairona[nci_wide$Terrain_Class=="Gentle + Dry"]
+tai_mod    <- nci_wide$Tairona[nci_wide$Terrain_Class=="Moderate slope"]
+```
+
+# 17. Figure 11. Accessible cultivable area and population estimates
+
+```{r s17-fig11-carrying-capacity}
+
+p7a <- ggplot(cc_df, aes(x=Buffer, y=Accessible_ha, fill=Period)) +
+  geom_col(position="dodge", color="black", width=0.7) +
+  scale_fill_manual(values=period_colors) +
+  scale_y_continuous(expand=expansion(mult=c(0, 0.05))) +
+  labs(title="A. Accessible Cultivable Area (Tobler isochrones)",
+       x="Walking time", y="Area (ha)") +
+  theme_bw() + theme(
+    plot.title      = element_text(face="bold", size=11, hjust=0.5, color="black"),
+    legend.position = "bottom",
+    axis.text       = element_text(color="black"),
+    axis.title      = element_text(color="black"),
+    legend.text     = element_text(color="black"),
+    legend.title    = element_text(color="black"))
+
+pop_long <- pop_estimates %>%
+  pivot_longer(cols=c(Pop_low, Pop_mid, Pop_high),
+               names_to="Scenario", values_to="Population") %>%
+  mutate(Scenario=factor(Scenario,
+    levels=c("Pop_low","Pop_mid","Pop_high"),
+    labels=c("5 pers/struct","8 pers/struct","10 pers/struct")))
+
+p7b <- ggplot(pop_long, aes(x=Period, y=Population, fill=Scenario)) +
+  geom_col(position="dodge", color="black", width=0.7) +
+  scale_fill_manual(values=c("#91bfdb","#4575b4","#313695")) +
+  scale_y_continuous(expand=expansion(mult=c(0, 0.05))) +
+  labs(title="B. Population Estimates by Period (Berrey 2018)", x="", y="Persons") +
+  theme_bw() + theme(
+    plot.title      = element_text(face="bold", size=11, hjust=0.5, color="black"),
+    legend.position = "bottom",
+    axis.text       = element_text(color="black"),
+    axis.title      = element_text(color="black"),
+    legend.text     = element_text(color="black"),
+    legend.title    = element_text(color="black"))
+fig6 <- p7a | p7b
+print(fig6)
+
+neg_acc <- cc_df$Accessible_ha[cc_df$Period=="Neguanje" & cc_df$Buffer=="90 min"]
+bur_acc <- cc_df$Accessible_ha[cc_df$Period=="Buritaca" & cc_df$Buffer=="90 min"]
+tai_acc <- cc_df$Accessible_ha[cc_df$Period=="Tairona"  & cc_df$Buffer=="90 min"]
+```
+
+# 18. Figure 12. PCA of topographic niche
+
+```{r s18-fig12-pca}
+
+pca_vars   <- c("Slope_deg","TPI","TRI","Roughness","TWI","SPI","Solar_Proxy","HAND_proxy","Elevation")
+df_pca     <- df_struct %>% filter(complete.cases(across(all_of(pca_vars))))
+pca_result <- prcomp(df_pca[, pca_vars], scale.=TRUE, center=TRUE)
+var_exp    <- summary(pca_result)$importance
+pct_pc1    <- round(var_exp[2,1]*100, 1)
+pct_pc2    <- round(var_exp[2,2]*100, 1)
+loadings   <- data.frame(Variable=pca_vars,
+  PC1=round(pca_result$rotation[,1],4),
+  PC2=round(pca_result$rotation[,2],4))
+scores     <- data.frame(df_pca[,c("Period")], pca_result$x[,1:2])
+colnames(scores) <- c("Period","PC1","PC2")
+
+p8b <- ggplot(loadings %>%
+                pivot_longer(cols=c(PC1,PC2), names_to="Component", values_to="Loading"),
+              aes(x=reorder(Variable, abs(Loading)), y=Loading, fill=Component)) +
+  geom_col(position="dodge", color="black", width=0.6) +
+  coord_flip() +
+  scale_fill_manual(values=c(PC1="#d73027", PC2="#4575b4")) +
+  scale_y_continuous(expand=expansion(mult=c(0.05, 0.05))) +
+  labs(title=sprintf("A. PCA Loadings  |  PC1 = %.1f%%  |  PC2 = %.1f%%", pct_pc1, pct_pc2),
+       x="", y="Loading Coefficient") +
+  theme_bw() + theme(
+    plot.title      = element_text(face="bold", size=12, hjust=0.5, color="black"),
+    legend.position = "bottom",
+    axis.text       = element_text(color="black", size=10),
+    axis.title      = element_text(color="black", size=11),
+    legend.text     = element_text(color="black", size=10),
+    legend.title    = element_text(color="black", size=10))
+
+df_hs2 <- as.data.frame(hillshade, xy=TRUE, na.rm=TRUE); colnames(df_hs2)[3] <- "hs"
+df_hs2$hs_norm <- (df_hs2$hs - min(df_hs2$hs, na.rm=TRUE)) /
+  (max(df_hs2$hs, na.rm=TRUE) - min(df_hs2$hs, na.rm=TRUE))
+
+coords_all       <- st_coordinates(
+  all_structures %>% filter(complete.cases(st_drop_geometry(.)[,pca_vars])))
+df_pca_spatial   <- data.frame(Period=df_pca$Period, PC1=pca_result$x[,1])
+df_pca_spatial$x <- coords_all[,1]
+df_pca_spatial$y <- coords_all[,2]
+
+p8c <- ggplot() +
+  geom_raster(data=df_hs2, aes(x=x, y=y, fill=hs_norm), show.legend=FALSE) +
+  scale_fill_gradient(low="gray20", high="white", guide="none") +
+  geom_point(data=df_pca_spatial, aes(x=x, y=y), color="black", size=1.8, alpha=0.9) +
+  geom_point(data=df_pca_spatial, aes(x=x, y=y, color=PC1), size=1.2, alpha=1.0) +
+  scale_color_gradientn(
+    colors=c("#5e4fa2","#3288bd","#66c2a5","#abdda4","#e6f598",
+             "#ffffbf","#fee08b","#fdae61","#f46d43","#d53e4f","#9e0142"),
+    name="PC1 Score",
+    limits=range(df_pca_spatial$PC1, na.rm=TRUE)) +
+  geom_sf(data=survey_sf, fill=NA, color="black", linewidth=0.6, linetype="dashed") +
+  coord_sf(datum=NA) +
+  facet_wrap(~Period, ncol=3) +
+  ggspatial::annotation_north_arrow(
+    location="tl", style=north_arrow_fancy_orienteering(),
+    height=unit(0.7,"cm"), width=unit(0.7,"cm")) +
+  ggspatial::annotation_scale(
+    location="br", unit_category="metric",
+    text_col="black", line_col="black") +
+  labs(title="B. Spatial Distribution of PC1 Scores by Period") +
+  theme_bw() + theme(
+    plot.title       = element_text(face="bold", size=12, hjust=0.5, color="black"),
+    axis.text        = element_blank(),
+    axis.ticks       = element_blank(),
+    axis.title       = element_blank(),
+    strip.background = element_rect(fill="gray90", color="black"),
+    strip.text       = element_text(face="bold", size=11, color="black"),
+    legend.position  = "bottom",
+    legend.key.width = unit(2,"cm"),
+    legend.text      = element_text(color="black", size=10),
+    legend.title     = element_text(color="black", face="bold", size=10),
+    panel.grid.major = element_line(color="transparent"))
+
+fig7 <- p8b / p8c + plot_layout(heights=c(1,1.4)) +
+  plot_annotation(
+    title="Figure 12. Multivariate Topographic Niche",
+    theme=theme(plot.title=element_text(face="bold",size=15,hjust=0.5,color="black")))
+print(fig7)
+
+manova_result <- manova(cbind(PC1,PC2)~Period, data=scores)
+
+```
+
+# 19. Figure 13. Empirical cumulative distribution functions
+
+```{r s19-fig13-ecdfs}
+
+p10a <- ggplot(df_struct, aes(x=Slope_deg, color=Period)) +
+  stat_ecdf(linewidth=0.8) +
+  scale_color_manual(values=period_colors) +
+  geom_vline(xintercept=c(12,20,30), linetype="dotted", color="gray50") +
+  labs(title="A. Slope", x="Slope (°)", y="Cumulative proportion") +
+  theme_bw() + theme(plot.title=element_text(face="bold",size=10,color="black"),
+    legend.position="bottom", axis.text=element_text(color="black"),
+    axis.title=element_text(color="black"), legend.text=element_text(color="black"),
+    legend.title=element_text(color="black"))
+
+p10b <- ggplot(df_struct, aes(x=Elevation, color=Period)) +
+  stat_ecdf(linewidth=0.8) +
+  scale_color_manual(values=period_colors) +
+  labs(title="B. Elevation", x="Elevation (m)", y="Cumulative proportion") +
+  theme_bw() + theme(plot.title=element_text(face="bold",size=10,color="black"),
+    legend.position="bottom", axis.text=element_text(color="black"),
+    axis.title=element_text(color="black"), legend.text=element_text(color="black"),
+    legend.title=element_text(color="black"))
+
+p10c <- ggplot(df_struct, aes(x=TWI, color=Period)) +
+  stat_ecdf(linewidth=0.8) +
+  scale_color_manual(values=period_colors) +
+  labs(title="C. TWI", x="TWI", y="Cumulative proportion") +
+  theme_bw() + theme(plot.title=element_text(face="bold",size=10,color="black"),
+    legend.position="bottom", axis.text=element_text(color="black"),
+    axis.title=element_text(color="black"), legend.text=element_text(color="black"),
+    legend.title=element_text(color="black"))
+
+p10d <- ggplot(df_struct, aes(x=TPI, color=Period)) +
+  stat_ecdf(linewidth=0.8) +
+  scale_color_manual(values=period_colors) +
+  geom_vline(xintercept=0, linetype="dashed", color="gray50") +
+  labs(title="D. TPI", x="TPI", y="Cumulative proportion") +
+  theme_bw() + theme(plot.title=element_text(face="bold",size=10,color="black"),
+    legend.position="bottom", axis.text=element_text(color="black"),
+    axis.title=element_text(color="black"), legend.text=element_text(color="black"),
+    legend.title=element_text(color="black"))
+
+fig8 <- (p10a|p10b)/(p10c|p10d)+
+  plot_annotation(title="Figure 13. Empirical Cumulative Distribution Functions by Period",
+    theme=theme(plot.title=element_text(face="bold",size=13,hjust=0.5,color="black")))
+print(fig8)
+
+ks_results <- list()
+for(v in c("Slope_deg","Elevation","TWI","TPI")){
+  for(pair in pairs_list){
+    x  <- df_struct[[v]][df_struct$Period==pair[1]]
+    y  <- df_struct[[v]][df_struct$Period==pair[2]]
+    ks <- suppressWarnings(ks.test(x,y))
+    ks_results[[paste(v,pair[1],pair[2])]] <- list(D=ks$statistic, p=ks$p.value)
+  }
+}
+
+slope_neg_bur <- ks_results[["Slope_deg Neguanje Buritaca"]]
+slope_bur_tai <- ks_results[["Slope_deg Buritaca Tairona"]]
+slope_neg_tai <- ks_results[["Slope_deg Neguanje Tairona"]]
+elev_neg_bur  <- ks_results[["Elevation Neguanje Buritaca"]]
+elev_bur_tai  <- ks_results[["Elevation Buritaca Tairona"]]
+twi_max_D     <- max(ks_results[["TWI Neguanje Buritaca"]]$D,
+                     ks_results[["TWI Buritaca Tairona"]]$D,
+                     ks_results[["TWI Neguanje Tairona"]]$D)
+tpi_max_D     <- max(ks_results[["TPI Neguanje Buritaca"]]$D,
+                     ks_results[["TPI Buritaca Tairona"]]$D,
+                     ks_results[["TPI Neguanje Tairona"]]$D)
+neg_bur_min_p <- min(slope_neg_bur$p, elev_neg_bur$p,
+                     ks_results[["TWI Neguanje Buritaca"]]$p,
+                     ks_results[["TPI Neguanje Buritaca"]]$p)
+```
+
+# 20. Table 5. Robustness checks
+
+```{r s20-table5-robustness}
+
+n_iter    <- 1000
+n_sub     <- min(table(df_struct$Period))
+test_vars <- c("Slope_deg", "Elevation", "TWI", "TPI")
+
+balanced_results <- list()
+set.seed(42)
+
+for (v in test_vars) {
+  iter_results <- furrr::future_map(
+    1:n_iter,
+    function(iter) {
+      sub_df <- df_struct %>%
+        group_by(Period) %>%
+        slice_sample(n = n_sub) %>%
+        ungroup()
+
+      kw <- kruskal.test(as.formula(paste(v, "~ Period")), data = sub_df)
+      kw_sig <- as.integer(kw$p.value < 0.05)
+
+      pair_sig <- integer(3)
+      for (j in seq_along(pairs_list)) {
+        pair <- pairs_list[[j]]
+        x <- sub_df[[v]][sub_df$Period == pair[1]]
+        y <- sub_df[[v]][sub_df$Period == pair[2]]
+        ks <- suppressWarnings(ks.test(x, y))
+        pair_sig[j] <- as.integer(ks$p.value < 0.05)
+      }
+
+      c(kw_sig, pair_sig)
+    },
+    .options = furrr::furrr_options(seed = TRUE)
+  )
+
+  res_mat <- do.call(rbind, iter_results)
+
+  balanced_results[[v]] <- tibble(
+    Variable   = v,
+    KW_pct     = round(100 * sum(res_mat[, 1]) / n_iter, 1),
+    NegBur_pct = round(100 * sum(res_mat[, 2]) / n_iter, 1),
+    BurTai_pct = round(100 * sum(res_mat[, 3]) / n_iter, 1),
+    NegTai_pct = round(100 * sum(res_mat[, 4]) / n_iter, 1)
+  )
+
+}
+
+subsample_df <- bind_rows(balanced_results)
+
+df_clean <- all_structures %>%
+  filter(!is.na(Elevation), !is.na(Slope_deg), !is.na(TWI), !is.na(TPI))
+
+site_means_list <- lapply(periods, function(p) {
+  struct_p <- df_clean %>% filter(Period == p)
+  sites_p  <- all_sites %>% filter(Period == p)
+  
+  near_idx <- st_nearest_feature(struct_p, sites_p)
+  
+  struct_p %>%
+    st_drop_geometry() %>%
+    mutate(Site_ID = near_idx) %>%
+    group_by(Site_ID, Period) %>%
+    summarise(across(c(Slope_deg, TWI, Elevation, TPI),
+                     \(x) mean(x, na.rm=TRUE), .names="{.col}_mean"),
+              .groups="drop")
+})
+
+site_means <- bind_rows(site_means_list)
+
+kw_site_list <- list()
+for (v in c("Slope_deg_mean","TWI_mean","Elevation_mean","TPI_mean")) {
+  kw <- kruskal.test(as.formula(paste(v, "~ Period")), data=site_means)
+  kw_site_list[[v]] <- tibble(
+    Variable = sub("_mean","",v),
+    N_Neg = sum(site_means$Period=="Neguanje"),
+    N_Bur = sum(site_means$Period=="Buritaca"),
+    N_Tai = sum(site_means$Period=="Tairona"),
+    Chi2_Site  = round(kw$statistic, 2),
+    p_val_Site = ifelse(kw$p.value < 0.001, "< 0.001", format(round(kw$p.value, 4))))
+}
+site_kw_df <- bind_rows(kw_site_list)
+
+table3 <- dplyr::left_join(subsample_df, site_kw_df, by = "Variable")
+
+knitr::kable(table3,
+  caption = paste0(
+    "Table 5. Robustness checks - balanced subsampling and site-level aggregation. ",
+    "Columns KW-Neg/Tai: percentage of 1,000 balanced-subsample iterations (N = 319 per period) ",
+    "yielding p < 0.05 for Kruskal-Wallis omnibus (KW) and pairwise Kolmogorov-Smirnov tests ",
+    "(Neg/Bur, Bur/Tai, Neg/Tai). Columns N-Neg-p-site: site-level Kruskal-Wallis statistics ",
+    "computed on structure means aggregated to the nearest archaeological site within each period ",
+    "(reference totals: Neguanje = 190 sites; Buritaca = 178; Tairona = 551). ",
+    "All site-level p-values > 0.05 confirm non-significant inter-period differences."),
+  align = "c",
+  col.names = c("Variable",
+                "KW (%)", "Neg/Bur (%)", "Bur/Tai (%)", "Neg/Tai (%)",
+                "N-Neg", "N-Bur", "N-Tai", "chi² (site)", "p (site)")
+)
+
+slope_kw   <- table3$KW_pct[table3$Variable == "Slope_deg"]
+slope_bt   <- table3$BurTai_pct[table3$Variable == "Slope_deg"]
+slope_nt   <- table3$NegTai_pct[table3$Variable == "Slope_deg"]
+slope_nb   <- table3$NegBur_pct[table3$Variable == "Slope_deg"]
+elev_bt    <- table3$BurTai_pct[table3$Variable == "Elevation"]
+elev_nt    <- table3$NegTai_pct[table3$Variable == "Elevation"]
+twi_max    <- max(table3$BurTai_pct[table3$Variable == "TWI"],
+                  table3$NegTai_pct[table3$Variable == "TWI"],
+                  table3$NegBur_pct[table3$Variable == "TWI"])
+tpi_max    <- max(table3$BurTai_pct[table3$Variable == "TPI"],
+                  table3$NegTai_pct[table3$Variable == "TPI"],
+                  table3$NegBur_pct[table3$Variable == "TPI"])
+site_slope_p <- site_kw_df$p_val_Site[site_kw_df$Variable == "Slope_deg"]
+site_twi_p   <- site_kw_df$p_val_Site[site_kw_df$Variable == "TWI"]
+n_sites_neg  <- table3$N_Neg[1]; n_sites_bur <- table3$N_Bur[1]; n_sites_tai <- table3$N_Tai[1]
+```
